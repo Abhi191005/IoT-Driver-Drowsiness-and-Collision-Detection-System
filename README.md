@@ -123,9 +123,9 @@ Instead of executing resource-intensive DNN/OpenCV facial landmark tracking, the
 | :--- | :--- | :--- | :--- |
 | **GPIO 5** | OUTPUT | HC-SR04 TRIG | $10\,\mu\text{s}$ ultrasonic pulse trigger |
 | **GPIO 18** | INPUT | HC-SR04 ECHO (via divider) | Acoustic time-of-flight echo return |
-| **GPIO 19** | OUTPUT | Red LED (via $220\,\Omega$) | Hazard alert indicator |
-| **GPIO 21** | OUTPUT | Green LED (via $220\,\Omega$) | Safe condition indicator |
-| **GPIO 22** | OUTPUT | Active Buzzer | Audible acoustic alarm |
+| **GPIO 4** | OUTPUT | Red LED (via $220\,\Omega$) | Hazard alert indicator |
+| **GPIO 15** | OUTPUT | Green LED (via $220\,\Omega$) | Safe condition indicator |
+| **GPIO 13** | OUTPUT | Active Buzzer | Audible acoustic alarm |
 | **5V / VIN** | POWER | HC-SR04 VCC, ESP32-CAM VCC | $5\,\text{V}$ power rail |
 | **GND** | POWER | Common Ground | Unified system ground reference |
 

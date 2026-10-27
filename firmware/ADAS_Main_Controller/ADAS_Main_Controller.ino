@@ -1,441 +1,568 @@
 /*
  * =====================================================================================
  * Project: IoT-Enabled Advanced Driver Assistance System (ADAS)
- * Module:  ADAS Main Controller Firmware
+ * Module:  ADAS Main Controller Firmware (Full Version with Acoustic & Telemetry Alerts)
  * Target:  ESP32 DevKit V1
  * Authors: Abhi Shah, Sahilali Dholkawala, Sanghani Karan
  * Institute: Dharmsinh Desai University (DDU)
  *
  * Description:
  *   Real-time collision detection and warning system using an HC-SR04 ultrasonic
- *   sensor with a 10-sample circular moving-average filter and 4-zone proximity
- *   classification (Danger, Warning, Caution, Safe). Implements a non-blocking
- *   multitasking architecture with millis() separating real-time safety actuation
- *   (5 Hz) from background Telegram Bot IoT communication (0.2 Hz).
+ *   sensor with a 10-sample moving-average filter and 4-tier proximity classification.
+ *   Provides serial bar visualization, non-blocking acoustic/visual alerts, session
+ *   analytics (min/max/event counts), and bidirectional Telegram Bot command & control.
  * =====================================================================================
  */
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
 
 // =====================================================================================
-// PIN DEFINITIONS & HARDWARE ASSIGNMENTS
+// WIFI & TELEGRAM CONFIGURATION
 // =====================================================================================
-#define TRIG_PIN       5    // HC-SR04 Trigger Pin (Output, 10us HIGH pulse)
-#define ECHO_PIN       18   // HC-SR04 Echo Pin (Input, via 3.3k + 3.3k Voltage Divider)
-#define RED_LED_PIN    19   // Red Indicator LED (Danger / Warning Alert)
-#define GREEN_LED_PIN  21   // Green Indicator LED (Caution / Safe Status)
-#define BUZZER_PIN     22   // 5V Active Buzzer (Acoustic Audio Alert)
+const char* ssid     = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+#define BOT_TOKEN "YOUR_BOT_TOKEN"
+#define CHAT_ID   "YOUR_CHAT_ID"
 
 // =====================================================================================
-// NETWORK & TELEGRAM BOT CONFIGURATION
+// PIN ASSIGNMENTS
 // =====================================================================================
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#define TRIG_PIN    5    // Ultrasonic Trigger Pin
+#define ECHO_PIN    18   // Ultrasonic Echo Pin (via 3.3k + 3.3k Voltage Divider)
+#define RED_LED     4    // Red LED (Danger / Warning Indicator)
+#define GREEN_LED   15   // Green LED (Safe / Caution Indicator)
+#define BUZZER      13   // 5V Active Buzzer (Acoustic Alert)
 
-// Telegram credentials (obtained via @BotFather and @userinfobot)
-#define BOT_TOKEN "YOUR_TELEGRAM_BOT_TOKEN"
-#define CHAT_ID   "YOUR_AUTHORIZED_CHAT_ID"
+// =====================================================================================
+// DISTANCE THRESHOLDS (cm)
+// =====================================================================================
+#define DANGER_DIST  20
+#define WARNING_DIST 50
+#define SAFE_DIST    100
 
+// =====================================================================================
+// SYSTEM OBJECTS & TIMERS
+// =====================================================================================
 WiFiClientSecure secured_client;
 UniversalTelegramBot bot(BOT_TOKEN, secured_client);
 
-// =====================================================================================
-// PROXIMITY ZONE DEFINITIONS
-// =====================================================================================
-enum Zone {
-  ZONE_DANGER,   // < 20 cm: Fast Red blink, fast buzzer beep, Telegram alert
-  ZONE_WARNING,  // 20 - 50 cm: Slow Red blink, slow buzzer beep, Telegram alert
-  ZONE_CAUTION,  // 50 - 100 cm: Green blink, silent buzzer
-  ZONE_SAFE      // > 100 cm: Green solid ON, Red OFF, silent buzzer
-};
+unsigned long lastTelegramCheck = 0;
+unsigned long lastAlert         = 0;
+unsigned long systemStartTime   = 0;
+unsigned long lastBlink         = 0;
 
-// =====================================================================================
-// MOVING AVERAGE FILTER CONFIGURATION
-// =====================================================================================
-#define NUM_READINGS 10
-float readings[NUM_READINGS];
-int readIndex = 0;
-float runningTotal = 0.0;
-bool filterPopulated = false;
+bool systemArmed      = true;
+bool blinkState       = false;
+String currentZone    = "CLEAR";
+String lastAlertedZone= "CLEAR";
 
-// =====================================================================================
-// TIMING CONSTANTS (NON-BLOCKING MULTITASKING)
-// =====================================================================================
-const unsigned long SENSOR_INTERVAL   = 200;   // 5 Hz polling rate for real-time safety
-const unsigned long TELEGRAM_INTERVAL = 5000;  // 0.2 Hz polling rate for IoT background task
+float currentDistance = 999;
+float minDistance     = 999;
+float maxDistance     = 0;
 
-const unsigned long BLINK_DANGER_MS   = 150;   // Rapid hazard alert cycle
-const unsigned long BLINK_WARNING_MS  = 500;   // Cautionary alert cycle
-const unsigned long BLINK_CAUTION_MS  = 800;   // Safe proximity awareness cycle
+int dangerCount   = 0;
+int warningCount  = 0;
+int cautionCount  = 0;
+int totalReadings = 0;
 
-// =====================================================================================
-// SYSTEM STATE VARIABLES
-// =====================================================================================
-Zone currentZone = ZONE_SAFE;
-Zone previousReportedZone = ZONE_SAFE;
-
-bool systemArmed = true;         // Arm/Disarm remote control state
-bool alertState = false;         // Output toggle state for blinking LEDs / Buzzer
-
-unsigned long lastSensorTime   = 0;
-unsigned long lastTelegramTime = 0;
-unsigned long lastBlinkTime    = 0;
-
-// Telemetry & Statistics
-unsigned long dangerEventCount  = 0;
-unsigned long warningEventCount = 0;
+// 10-Sample Moving Average Buffer
+#define NUM_SAMPLES 10
+float samples[NUM_SAMPLES];
+int sampleIndex = 0;
 
 // =====================================================================================
 // FUNCTION PROTOTYPES
 // =====================================================================================
-float measureRawDistance();
-float getSmoothedDistance();
-Zone classifyZone(float distance);
-void updateHardwareOutputs(Zone zone);
-void handleTelegramUpdates();
-void processIncomingCommand(const telegramMessage& msg);
-void sendZoneChangeNotification(Zone newZone, float distance);
+float singleReading();
+float getSmoothed();
+String getZone(float dist);
+void controlOutputs();
+void printBar(float distance);
+void sendAlert(float distance);
+void checkCommands();
+String formatTime();
 void connectWiFi();
 
 // =====================================================================================
 // SETUP
 // =====================================================================================
 void setup() {
-  Serial.begin(115200);
-  delay(100);
+    Serial.begin(115200);
+    delay(1000);
 
-  Serial.println("\n=======================================================");
-  Serial.println("  IoT-Enabled ADAS Main Controller Starting Up...     ");
-  Serial.println("=======================================================");
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    pinMode(RED_LED, OUTPUT);
+    pinMode(GREEN_LED, OUTPUT);
+    pinMode(BUZZER, OUTPUT);
 
-  // Pin mode configuration
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(RED_LED_PIN, OUTPUT);
-  pinMode(GREEN_LED_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(BUZZER, LOW);
 
-  // Initialize outputs to safe inactive state
-  digitalWrite(TRIG_PIN, LOW);
-  digitalWrite(RED_LED_PIN, LOW);
-  digitalWrite(GREEN_LED_PIN, LOW);
-  digitalWrite(BUZZER_PIN, LOW);
+    for (int i = 0; i < NUM_SAMPLES; i++) samples[i] = 999;
 
-  // Initialize circular moving-average buffer
-  for (int i = 0; i < NUM_READINGS; i++) {
-    readings[i] = 200.0; // Default baseline at SAFE distance
-  }
-  runningTotal = 200.0 * NUM_READINGS;
+    Serial.println("\n=================================");
+    Serial.println("  ADAS Safety System Starting... ");
+    Serial.println("=================================");
 
-  // Configure SSL client: bypass strict root CA chain check for embedded reliability
-  secured_client.setInsecure();
+    // Startup Hardware Self-Test (LED + Buzzer verification pulse)
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(BUZZER, HIGH);
+    delay(200);
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(BUZZER, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    delay(200);
 
-  // Connect to Wi-Fi network
-  connectWiFi();
+    connectWiFi();
+    secured_client.setInsecure();
 
-  // Startup verification pulse
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  delay(500);
-  digitalWrite(GREEN_LED_PIN, LOW);
+    systemStartTime = millis();
 
-  Serial.println("System Initialized. Entering Non-Blocking Scheduler Loop.\n");
+    String msg = "=================================\n";
+    msg += "   ADAS SAFETY SYSTEM ONLINE\n";
+    msg += "=================================\n\n";
+    msg += "All modules initialized:\n";
+    msg += "  Ultrasonic Sensor: ACTIVE\n";
+    msg += "  Red LED (Danger): ACTIVE\n";
+    msg += "  Green LED (Safe): ACTIVE\n";
+    msg += "  Buzzer Alert: ACTIVE\n";
+    msg += "  WiFi: CONNECTED\n";
+    msg += "  Signal: " + String(WiFi.RSSI()) + " dBm\n";
+    msg += "  IP: " + WiFi.localIP().toString() + "\n\n";
+    msg += "Alert Zones:\n";
+    msg += "  DANGER:  < 20cm (fast beep)\n";
+    msg += "  WARNING: 20-50cm (slow beep)\n";
+    msg += "  CAUTION: 50-100cm (watching)\n";
+    msg += "  SAFE:    > 100cm (all clear)\n\n";
+    msg += "Available Commands:\n";
+    msg += "  /status   - Full system report\n";
+    msg += "  /distance - Live distance reading\n";
+    msg += "  /arm      - Activate all alerts\n";
+    msg += "  /disarm   - Pause all alerts\n";
+    msg += "  /stats    - Trip safety report\n";
+    msg += "  /help     - Show all commands\n\n";
+    msg += "System is monitoring. Drive safe!";
+    bot.sendMessage(CHAT_ID, msg, "");
+
+    Serial.println("Ready!");
 }
 
 // =====================================================================================
-// MAIN LOOP: NON-BLOCKING DUAL-LAYER SCHEDULER
+// MAIN LOOP
 // =====================================================================================
 void loop() {
-  unsigned long currentMillis = millis();
+    float raw = singleReading();
+    samples[sampleIndex] = raw;
+    sampleIndex = (sampleIndex + 1) % NUM_SAMPLES;
+    currentDistance = getSmoothed();
 
-  // -----------------------------------------------------------------------------------
-  // LAYER 1: REAL-TIME SAFETY LAYER (Executes every 200 ms / 5 Hz)
-  // -----------------------------------------------------------------------------------
-  if (currentMillis - lastSensorTime >= SENSOR_INTERVAL) {
-    lastSensorTime = currentMillis;
-
-    float smoothedDistance = getSmoothedDistance();
-    currentZone = classifyZone(smoothedDistance);
-
-    // Track state metrics
-    if (currentZone != previousReportedZone) {
-      if (currentZone == ZONE_DANGER) dangerEventCount++;
-      if (currentZone == ZONE_WARNING) warningEventCount++;
+    // Track session min/max records
+    totalReadings++;
+    if (currentDistance < 400) {
+        if (currentDistance < minDistance) minDistance = currentDistance;
+        if (currentDistance > maxDistance) maxDistance = currentDistance;
     }
 
-    // Print diagnostic telemetry to UART
-    Serial.printf("[ADAS] Dist: %6.1f cm | Zone: %-8s | Armed: %s\n",
-                  smoothedDistance,
-                  currentZone == ZONE_DANGER  ? "DANGER" :
-                  currentZone == ZONE_WARNING ? "WARNING" :
-                  currentZone == ZONE_CAUTION ? "CAUTION" : "SAFE",
-                  systemArmed ? "YES" : "NO");
-  }
+    String prevZone = currentZone;
+    currentZone = getZone(currentDistance);
 
-  // Drive Hardware Actuators (Continuous Blink Timing)
-  updateHardwareOutputs(currentZone);
-
-  // -----------------------------------------------------------------------------------
-  // LAYER 2: LOGGING & IOT BACKGROUND LAYER (Executes every 5000 ms / 0.2 Hz)
-  // -----------------------------------------------------------------------------------
-  if (currentMillis - lastTelegramTime >= TELEGRAM_INTERVAL) {
-    lastTelegramTime = currentMillis;
-
-    // Verify WiFi status; auto-reconnect if dropped
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WiFi] Lost connection. Attempting background reconnect...");
-      WiFi.reconnect();
-    } else {
-      // Send Telegram alert if proximity zone has transitioned
-      if (currentZone != previousReportedZone) {
-        sendZoneChangeNotification(currentZone, readings[readIndex]);
-        previousReportedZone = currentZone;
-      }
-
-      // Check and execute incoming remote commands
-      handleTelegramUpdates();
+    if (systemArmed) {
+        controlOutputs();
     }
-  }
-}
 
-// =====================================================================================
-// ULTRASONIC SENSOR ACQUISITION & FILTERING
-// =====================================================================================
+    if (currentZone == "DANGER") dangerCount++;
+    if (currentZone == "WARNING") warningCount++;
+    if (currentZone == "CAUTION") cautionCount++;
 
-// Trigger HC-SR04 and compute distance using acoustic time-of-flight
-float measureRawDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+    printBar(currentDistance);
 
-  // Measure round-trip echo pulse duration (30ms timeout = ~500cm max range)
-  long durationUs = pulseIn(ECHO_PIN, HIGH, 30000);
-
-  if (durationUs <= 0) {
-    return -1.0; // Out-of-range or sensor timeout
-  }
-
-  // Distance (cm) = (duration_us * 0.034 cm/us) / 2
-  float distance = (durationUs * 0.0343) / 2.0;
-
-  if (distance < 2.0 || distance > 450.0) {
-    return -1.0; // Reject out-of-spec physical bounds
-  }
-
-  return distance;
-}
-
-// 10-sample circular moving-average filter with outlier rejection
-float getSmoothedDistance() {
-  float newReading = measureRawDistance();
-
-  // Outlier Handling: If reading is invalid, retain last known valid sample
-  if (newReading < 0) {
-    int prevIndex = (readIndex - 1 + NUM_READINGS) % NUM_READINGS;
-    newReading = readings[prevIndex];
-  }
-
-  // Circular buffer update
-  runningTotal -= readings[readIndex];
-  readings[readIndex] = newReading;
-  runningTotal += newReading;
-  readIndex = (readIndex + 1) % NUM_READINGS;
-
-  return runningTotal / (float)NUM_READINGS;
-}
-
-// =====================================================================================
-// ZONE CLASSIFICATION STATE MACHINE
-// =====================================================================================
-Zone classifyZone(float distance) {
-  if (distance < 20.0)  return ZONE_DANGER;
-  if (distance < 50.0)  return ZONE_WARNING;
-  if (distance < 100.0) return ZONE_CAUTION;
-  return ZONE_SAFE;
-}
-
-// =====================================================================================
-// HARDWARE OUTPUT ACTUATION (NON-BLOCKING)
-// =====================================================================================
-void updateHardwareOutputs(Zone zone) {
-  unsigned long now = millis();
-
-  switch (zone) {
-    case ZONE_DANGER:
-      // Fast blinking and beeping (150ms interval)
-      if (now - lastBlinkTime >= BLINK_DANGER_MS) {
-        lastBlinkTime = now;
-        alertState = !alertState;
-        digitalWrite(RED_LED_PIN, alertState ? HIGH : LOW);
-        digitalWrite(BUZZER_PIN, (systemArmed && alertState) ? HIGH : LOW);
-        digitalWrite(GREEN_LED_PIN, LOW);
-      }
-      break;
-
-    case ZONE_WARNING:
-      // Moderate warning blinking and beeping (500ms interval)
-      if (now - lastBlinkTime >= BLINK_WARNING_MS) {
-        lastBlinkTime = now;
-        alertState = !alertState;
-        digitalWrite(RED_LED_PIN, alertState ? HIGH : LOW);
-        digitalWrite(BUZZER_PIN, (systemArmed && alertState) ? HIGH : LOW);
-        digitalWrite(GREEN_LED_PIN, LOW);
-      }
-      break;
-
-    case ZONE_CAUTION:
-      // Slow awareness blink (800ms interval), buzzer silent
-      digitalWrite(RED_LED_PIN, LOW);
-      digitalWrite(BUZZER_PIN, LOW);
-      if (now - lastBlinkTime >= BLINK_CAUTION_MS) {
-        lastBlinkTime = now;
-        alertState = !alertState;
-        digitalWrite(GREEN_LED_PIN, alertState ? HIGH : LOW);
-      }
-      break;
-
-    case ZONE_SAFE:
-    default:
-      // Solid green, red and buzzer completely off
-      digitalWrite(RED_LED_PIN, LOW);
-      digitalWrite(BUZZER_PIN, LOW);
-      digitalWrite(GREEN_LED_PIN, HIGH);
-      break;
-  }
-}
-
-// =====================================================================================
-// TELEGRAM NOTIFICATIONS & COMMAND HANDLERS
-// =====================================================================================
-
-void sendZoneChangeNotification(Zone newZone, float distance) {
-  String msg = "";
-  switch (newZone) {
-    case ZONE_DANGER:
-      msg = "🚨 *COLLISION DANGER!*\nObstacle distance: " + String(distance, 1) + " cm\n*Action*: Immediate braking required!";
-      break;
-    case ZONE_WARNING:
-      msg = "⚠️ *PROXIMITY WARNING*\nObstacle detected at " + String(distance, 1) + " cm.";
-      break;
-    case ZONE_CAUTION:
-      msg = "ℹ️ *Caution Zone*\nForward path obstacle at " + String(distance, 1) + " cm.";
-      break;
-    case ZONE_SAFE:
-      msg = "✅ *Path Clear*\nObstacle cleared (> 100 cm). Safe to proceed.";
-      break;
-  }
-
-  if (msg.length() > 0) {
-    bot.sendMessage(CHAT_ID, msg, "Markdown");
-  }
-}
-
-void handleTelegramUpdates() {
-  int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-
-  while (numNewMessages) {
-    for (int i = 0; i < numNewMessages; i++) {
-      telegramMessage& msg = bot.messages[i];
-
-      // Validate security: reject messages not from authorized chat ID
-      if (msg.chat_id != CHAT_ID) {
-        bot.sendMessage(msg.chat_id, "⛔ Unauthorized Access Rejected.", "");
-        continue;
-      }
-
-      processIncomingCommand(msg);
+    // Non-blocking 5-second IoT check loop
+    if (millis() - lastTelegramCheck > 5000) {
+        if (systemArmed && currentZone != lastAlertedZone) {
+            sendAlert(currentDistance);
+        }
+        checkCommands();
+        lastTelegramCheck = millis();
     }
-    numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-  }
+
+    delay(200);
 }
 
-void processIncomingCommand(const telegramMessage& msg) {
-  String text = msg.text;
-  String from = msg.from_name;
+// =====================================================================================
+// HARDWARE OUTPUT CONTROL
+// =====================================================================================
+void controlOutputs() {
+    unsigned long now = millis();
 
-  Serial.println("[Telegram] Received command: " + text);
-
-  if (text == "/start" || text == "/help") {
-    String welcome = "🚗 *ADAS IoT Telemetry & Control*\n\n";
-    welcome += "Available Commands:\n";
-    welcome += "• `/status` - Current vehicle distance & zone\n";
-    welcome += "• `/distance` - Trigger 3-sample burst distance check\n";
-    welcome += "• `/arm` - Enable physical buzzer & red LED alerts\n";
-    welcome += "• `/disarm` - Mute buzzer alerts\n";
-    welcome += "• `/stats` - View session trip safety statistics\n";
-    bot.sendMessage(msg.chat_id, welcome, "Markdown");
-  }
-  else if (text == "/status") {
-    int prevIndex = (readIndex - 1 + NUM_READINGS) % NUM_READINGS;
-    float currentDist = readings[prevIndex];
-    unsigned long uptimeSec = millis() / 1000;
-
-    String status = "📊 *ADAS Status Report*\n\n";
-    status += "• *Proximity Zone*: " + String(currentZone == ZONE_DANGER ? "🚨 DANGER" :
-                                                currentZone == ZONE_WARNING ? "⚠️ WARNING" :
-                                                currentZone == ZONE_CAUTION ? "🟡 CAUTION" : "🟢 SAFE") + "\n";
-    status += "• *Smoothed Distance*: " + String(currentDist, 1) + " cm\n";
-    status += "• *Alarm System*: " + String(systemArmed ? "ARMED" : "DISARMED (Muted)") + "\n";
-    status += "• *Free SRAM*: " + String(ESP.getFreeHeap() / 1024) + " KB\n";
-    status += "• *Controller Uptime*: " + String(uptimeSec / 60) + "m " + String(uptimeSec % 60) + "s\n";
-    bot.sendMessage(msg.chat_id, status, "Markdown");
-  }
-  else if (text == "/distance") {
-    float sum = 0.0;
-    int valid = 0;
-    for (int k = 0; k < 3; k++) {
-      float d = measureRawDistance();
-      if (d > 0) { sum += d; valid++; }
-      delay(30);
+    if (currentZone == "DANGER") {
+        if (now - lastBlink > 150) {
+            blinkState = !blinkState;
+            digitalWrite(RED_LED, blinkState);
+            digitalWrite(BUZZER, blinkState);
+            lastBlink = now;
+        }
+        digitalWrite(GREEN_LED, LOW);
     }
-    float avg = (valid > 0) ? (sum / valid) : -1.0;
-    bot.sendMessage(msg.chat_id, "📏 *Active Distance Scan*: " + String(avg, 1) + " cm", "Markdown");
-  }
-  else if (text == "/arm") {
-    systemArmed = true;
-    bot.sendMessage(msg.chat_id, "🔔 *System ARMED*: Acoustic alerts and hazard LEDs are active.", "Markdown");
-  }
-  else if (text == "/disarm") {
-    systemArmed = false;
-    digitalWrite(BUZZER_PIN, LOW);
-    bot.sendMessage(msg.chat_id, "🔕 *System DISARMED*: Buzzer alerts muted. Visual LEDs remain active.", "Markdown");
-  }
-  else if (text == "/stats") {
-    String stats = "📈 *Trip Hazard Statistics*\n\n";
-    stats += "• Danger Events Logged: " + String(dangerEventCount) + "\n";
-    stats += "• Warning Events Logged: " + String(warningEventCount) + "\n";
-    stats += "• Total Uptime: " + String(millis() / 60000) + " minutes\n";
-    bot.sendMessage(msg.chat_id, stats, "Markdown");
-  }
-  else {
-    bot.sendMessage(msg.chat_id, "❓ Unknown command. Type `/help` for options.", "Markdown");
-  }
+    else if (currentZone == "WARNING") {
+        if (now - lastBlink > 500) {
+            blinkState = !blinkState;
+            digitalWrite(RED_LED, blinkState);
+            digitalWrite(BUZZER, blinkState);
+            lastBlink = now;
+        }
+        digitalWrite(GREEN_LED, LOW);
+    }
+    else if (currentZone == "CAUTION") {
+        digitalWrite(RED_LED, LOW);
+        digitalWrite(BUZZER, LOW);
+        if (now - lastBlink > 800) {
+            blinkState = !blinkState;
+            digitalWrite(GREEN_LED, blinkState);
+            lastBlink = now;
+        }
+    }
+    else {
+        digitalWrite(RED_LED, LOW);
+        digitalWrite(GREEN_LED, HIGH);
+        digitalWrite(BUZZER, LOW);
+    }
 }
 
 // =====================================================================================
-// WIFI MANAGEMENT
+// ULTRASONIC SENSOR SAMPLING & FILTERING
 // =====================================================================================
+float singleReading() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long d = pulseIn(ECHO_PIN, HIGH, 25000);
+    if (d == 0) return 999.0;
+
+    float dist = (d * 0.034) / 2.0;
+    if (dist < 2.0 || dist > 400.0) return 999.0;
+    return dist;
+}
+
+float getSmoothed() {
+    float sum = 0;
+    int count = 0;
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+        if (samples[i] > 0 && samples[i] < 500) {
+            sum += samples[i];
+            count++;
+        }
+    }
+    return count == 0 ? 999.0 : sum / count;
+}
+
+String getZone(float dist) {
+    if (dist > 400) return "CLEAR";
+    if (dist > SAFE_DIST) return "SAFE";
+    if (dist > WARNING_DIST) return "CAUTION";
+    if (dist > DANGER_DIST) return "WARNING";
+    return "DANGER";
+}
+
+// =====================================================================================
+// ASCII REAL-TIME SERIAL BAR VISUALIZATION
+// =====================================================================================
+void printBar(float distance) {
+    int f = 0;
+    if (distance < 400) f = 30 - (int)((distance / 400.0) * 30);
+    if (f < 0) f = 0;
+    if (f > 30) f = 30;
+    Serial.print("[");
+    for (int i = 0; i < 30; i++) Serial.print(i < f ? "#" : "-");
+    Serial.print("] ");
+    if (distance > 400) Serial.print("--- cm");
+    else {
+        Serial.print(distance, 1);
+        Serial.print(" cm");
+    }
+    Serial.print(" | ");
+    Serial.print(currentZone);
+    if (currentZone == "DANGER") Serial.print(" | BUZZER:FAST");
+    if (currentZone == "WARNING") Serial.print(" | BUZZER:SLOW");
+    Serial.println();
+}
+
+// =====================================================================================
+// TELEGRAM ALERT DISPATCH
+// =====================================================================================
+void sendAlert(float distance) {
+    if (millis() - lastAlert < 10000) return;
+    String msg = "";
+
+    if (currentZone == "DANGER") {
+        msg = "===========================\n";
+        msg += "  COLLISION DANGER ALERT!\n";
+        msg += "===========================\n\n";
+        msg += "Obstacle detected critically close!\n\n";
+        msg += "  Distance: " + String(distance, 1) + " cm\n";
+        msg += "  Zone: DANGER (< 20cm)\n";
+        msg += "  Red LED: FAST BLINKING\n";
+        msg += "  Buzzer: RAPID BEEPING\n\n";
+        msg += "Action Required:\n";
+        msg += "  APPLY BRAKES IMMEDIATELY!\n";
+        msg += "  Collision risk is HIGH!\n\n";
+        msg += "Time: " + formatTime() + " since start\n";
+        msg += "Danger events so far: " + String(dangerCount);
+    }
+    else if (currentZone == "WARNING") {
+        msg = "===========================\n";
+        msg += "  PROXIMITY WARNING!\n";
+        msg += "===========================\n\n";
+        msg += "Obstacle approaching vehicle!\n\n";
+        msg += "  Distance: " + String(distance, 1) + " cm\n";
+        msg += "  Zone: WARNING (20-50cm)\n";
+        msg += "  Red LED: SLOW BLINKING\n";
+        msg += "  Buzzer: SLOW BEEPING\n\n";
+        msg += "Action Required:\n";
+        msg += "  Reduce speed immediately!\n";
+        msg += "  Maintain safe distance.\n\n";
+        msg += "Time: " + formatTime() + " since start\n";
+        msg += "Warning events so far: " + String(warningCount);
+    }
+    else if (currentZone == "CAUTION") {
+        msg = "===========================\n";
+        msg += "  OBSTACLE DETECTED\n";
+        msg += "===========================\n\n";
+        msg += "Object detected in forward path.\n\n";
+        msg += "  Distance: " + String(distance, 1) + " cm\n";
+        msg += "  Zone: CAUTION (50-100cm)\n";
+        msg += "  Green LED: BLINKING\n";
+        msg += "  Buzzer: OFF\n\n";
+        msg += "Status: Monitoring obstacle.\n";
+        msg += "No immediate action required.\n";
+        msg += "System will alert if closer.";
+    }
+    else {
+        msg = "===========================\n";
+        msg += "  ALL CLEAR\n";
+        msg += "===========================\n\n";
+        msg += "No obstacles in forward path.\n\n";
+        msg += "  Distance: " + String(distance, 1) + " cm\n";
+        msg += "  Zone: SAFE (> 100cm)\n";
+        msg += "  Green LED: SOLID ON\n";
+        msg += "  Buzzer: OFF\n\n";
+        msg += "Status: Safe driving conditions.\n";
+        msg += "System continues monitoring.";
+    }
+
+    if (msg.length() > 0) {
+        bot.sendMessage(CHAT_ID, msg, "");
+        lastAlertedZone = currentZone;
+        lastAlert = millis();
+    }
+}
+
+// =====================================================================================
+// TELEGRAM COMMAND PROCESSING
+// =====================================================================================
+void checkCommands() {
+    int n = bot.getUpdates(bot.last_message_received + 1);
+    while (n) {
+        for (int i = 0; i < n; i++) {
+            String id = bot.messages[i].chat_id;
+            String t = bot.messages[i].text;
+            String name = bot.messages[i].from_name;
+
+            if (id != CHAT_ID) {
+                bot.sendMessage(id, "Access Denied!\nThis system is private.", "");
+                continue;
+            }
+
+            if (t == "/status") {
+                String s = "===========================\n";
+                s += "  ADAS SYSTEM STATUS\n";
+                s += "===========================\n\n";
+                s += "System State: " + String(systemArmed ? "ARMED & ACTIVE" : "DISARMED") + "\n\n";
+                s += "Current Readings:\n";
+                s += "  Distance: " + String(currentDistance, 1) + " cm\n";
+                s += "  Zone: " + currentZone + "\n";
+                s += "  Red LED: ";
+                if (currentZone == "DANGER") s += "FAST BLINK";
+                else if (currentZone == "WARNING") s += "SLOW BLINK";
+                else s += "OFF";
+                s += "\n  Green LED: ";
+                if (currentZone == "SAFE" || currentZone == "CLEAR") s += "SOLID ON";
+                else if (currentZone == "CAUTION") s += "BLINKING";
+                else s += "OFF";
+                s += "\n  Buzzer: ";
+                if (currentZone == "DANGER") s += "RAPID BEEP";
+                else if (currentZone == "WARNING") s += "SLOW BEEP";
+                else s += "SILENT";
+                s += "\n\nNetwork:\n";
+                s += "  WiFi Signal: " + String(WiFi.RSSI()) + " dBm\n";
+                s += "  IP Address: " + WiFi.localIP().toString() + "\n";
+                s += "\nSession Info:\n";
+                s += "  Uptime: " + formatTime() + "\n";
+                s += "  Total Readings: " + String(totalReadings) + "\n";
+                s += "  Closest Object: " + String(minDistance, 1) + " cm\n";
+                s += "  Farthest Object: " + String(maxDistance, 1) + " cm\n";
+                s += "\nSafety Events:\n";
+                s += "  Danger alerts: " + String(dangerCount) + "\n";
+                s += "  Warning alerts: " + String(warningCount) + "\n";
+                s += "  Caution alerts: " + String(cautionCount) + "\n";
+                s += "\nMemory: " + String(ESP.getFreeHeap()) + " bytes free";
+                bot.sendMessage(id, s, "");
+            }
+            else if (t == "/distance") {
+                float d1 = singleReading();
+                delay(100);
+                float d2 = singleReading();
+                delay(100);
+                float d3 = singleReading();
+
+                float avg = 999;
+                int cnt = 0;
+                float sum = 0;
+                if (d1 < 500) { sum += d1; cnt++; }
+                if (d2 < 500) { sum += d2; cnt++; }
+                if (d3 < 500) { sum += d3; cnt++; }
+                if (cnt > 0) avg = sum / cnt;
+
+                String s = "===========================\n";
+                s += "  LIVE DISTANCE READING\n";
+                s += "===========================\n\n";
+                s += "Three consecutive measurements:\n\n";
+                s += "  Reading 1: " + String(d1, 1) + " cm\n";
+                s += "  Reading 2: " + String(d2, 1) + " cm\n";
+                s += "  Reading 3: " + String(d3, 1) + " cm\n\n";
+                s += "  Average: " + String(avg, 1) + " cm\n";
+                s += "  Zone: " + getZone(avg) + "\n\n";
+                s += "Session records:\n";
+                s += "  Closest: " + String(minDistance, 1) + " cm\n";
+                s += "  Farthest: " + String(maxDistance, 1) + " cm";
+                bot.sendMessage(id, s, "");
+            }
+            else if (t == "/arm") {
+                systemArmed = true;
+                lastAlertedZone = "NONE";
+                String s = "===========================\n";
+                s += "  SYSTEM ARMED\n";
+                s += "===========================\n\n";
+                s += "All safety modules activated:\n\n";
+                s += "  Ultrasonic Sensor: MONITORING\n";
+                s += "  Red LED Alert: ENABLED\n";
+                s += "  Green LED Status: ENABLED\n";
+                s += "  Buzzer Alert: ENABLED\n";
+                s += "  Telegram Alerts: ENABLED\n\n";
+                s += "System will alert on obstacles.\n";
+                s += "Drive safe, " + name + "!";
+                bot.sendMessage(id, s, "");
+            }
+            else if (t == "/disarm") {
+                systemArmed = false;
+                digitalWrite(RED_LED, LOW);
+                digitalWrite(GREEN_LED, HIGH);
+                digitalWrite(BUZZER, LOW);
+                String s = "===========================\n";
+                s += "  SYSTEM DISARMED\n";
+                s += "===========================\n\n";
+                s += "All alerts paused:\n\n";
+                s += "  Buzzer: SILENCED\n";
+                s += "  Red LED: OFF\n";
+                s += "  Green LED: ON (standby)\n";
+                s += "  Telegram Alerts: PAUSED\n\n";
+                s += "Sensor still reading in background.\n";
+                s += "Send /arm to reactivate.";
+                bot.sendMessage(id, s, "");
+            }
+            else if (t == "/stats") {
+                String s = "===========================\n";
+                s += "  TRIP SAFETY REPORT\n";
+                s += "===========================\n\n";
+                s += "Session Duration: " + formatTime() + "\n\n";
+                s += "Safety Events:\n";
+                s += "  Danger (< 20cm): " + String(dangerCount) + " times\n";
+                s += "  Warning (20-50cm): " + String(warningCount) + " times\n";
+                s += "  Caution (50-100cm): " + String(cautionCount) + " times\n\n";
+                s += "Distance Records:\n";
+                s += "  Closest approach: " + String(minDistance, 1) + " cm\n";
+                s += "  Farthest reading: " + String(maxDistance, 1) + " cm\n";
+                s += "  Current distance: " + String(currentDistance, 1) + " cm\n\n";
+                s += "System Health:\n";
+                s += "  Total readings: " + String(totalReadings) + "\n";
+                s += "  WiFi signal: " + String(WiFi.RSSI()) + " dBm\n";
+                s += "  Free memory: " + String(ESP.getFreeHeap()) + " bytes\n";
+                s += "  System: " + String(systemArmed ? "ARMED" : "DISARMED");
+                bot.sendMessage(id, s, "");
+            }
+            else if (t == "/start" || t == "/help") {
+                String s = "===========================\n";
+                s += "  ADAS COMMAND CENTER\n";
+                s += "===========================\n\n";
+                s += "Available Commands:\n\n";
+                s += "  /status\n";
+                s += "    Full system status report\n";
+                s += "    Shows distance, zone, LEDs,\n";
+                s += "    buzzer, WiFi, memory usage\n\n";
+                s += "  /distance\n";
+                s += "    Takes 3 live measurements\n";
+                s += "    Shows average and zone\n\n";
+                s += "  /arm\n";
+                s += "    Activate all safety alerts\n";
+                s += "    LEDs + Buzzer + Telegram\n\n";
+                s += "  /disarm\n";
+                s += "    Pause all alerts\n";
+                s += "    Sensor keeps reading\n\n";
+                s += "  /stats\n";
+                s += "    Complete trip safety report\n";
+                s += "    Events, distances, health\n\n";
+                s += "  /help\n";
+                s += "    Show this command list";
+                bot.sendMessage(id, s, "");
+            }
+            else {
+                String s = "Unknown command: " + t + "\n\n";
+                s += "Try /help for available commands.";
+                bot.sendMessage(id, s, "");
+            }
+        }
+        n = bot.getUpdates(bot.last_message_received + 1);
+    }
+}
+
+// =====================================================================================
+// UTILITY FUNCTIONS
+// =====================================================================================
+String formatTime() {
+    unsigned long s = millis() / 1000;
+    unsigned long m = s / 60;
+    unsigned long h = m / 60;
+    s %= 60;
+    m %= 60;
+    String r = "";
+    if (h > 0) r += String(h) + "h ";
+    if (m > 0) r += String(m) + "m ";
+    r += String(s) + "s";
+    return r;
+}
+
 void connectWiFi() {
-  Serial.print("[WiFi] Connecting to: ");
-  Serial.println(WIFI_SSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Connected successfully!");
-    Serial.print("[WiFi] IP Address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\n[WiFi] Initial connection timeout. Will retry in background loop.");
-  }
+    Serial.print("WiFi");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    int a = 0;
+    while (WiFi.status() != WL_CONNECTED && a < 30) {
+        delay(500);
+        Serial.print(".");
+        a++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println(" OK!");
+    } else {
+        Serial.println(" FAIL!");
+        ESP.restart();
+    }
 }
