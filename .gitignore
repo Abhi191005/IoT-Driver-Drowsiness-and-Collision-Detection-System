@@ -1,0 +1,19 @@
+# Compiled Arduino / PlatformIO binaries
+*.hex
+*.bin
+*.elf
+*.o
+.pio/
+build/
+
+# Secrets / local WiFi credentials
+credentials.h
+secrets.h
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
